@@ -1,5 +1,4 @@
 # Door Knock Notification System (ESP8266 + WhatsApp)
-
 A smart, IoT-based door knock detection system that uses an ESP8266 and a vibration sensor to send instant WhatsApp notifications when someone knocks on your door. This project is designed to be highly responsive while filtering out false triggers from door slams or environmental noise.
 
 ## 🚀 Key Features
