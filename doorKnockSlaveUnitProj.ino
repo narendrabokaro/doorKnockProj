@@ -1,43 +1,43 @@
-#include <SoftwareSerial.h>
+// Based on Wemos D1 Mini
 #include <RCSwitch.h>
 
-// Pins
-const int rxPin = 4; // Not used but needed for constructor
-const int txPin = 3; // Physical Pin 2 -> Nano D2
-const int rfPin = 2; // Physical Pin 7 -> RF Data
-const int bzrPin = 1; // Physical Pin 6 -> Buzzer
-
-SoftwareSerial mySerial(-1, txPin); // TX only to save space
 RCSwitch mySwitch = RCSwitch();
+const int buzzerPin = 14; // D5 on Wemos D1 Mini
 
 void setup() {
-  mySerial.begin(9600);
-  pinMode(bzrPin, OUTPUT);
+  Serial.begin(115200);
+  pinMode(buzzerPin, OUTPUT);
 
-  mySerial.println("--- ATtiny85 Debug Boot ---");
+  // Receiver on D2 (Interrupt for GPIO 4)
+  mySwitch.enableReceive(digitalPinToInterrupt(4)); 
   
-  // Test Beep
-  digitalWrite(bzrPin, HIGH);
-  delay(200);
-  digitalWrite(bzrPin, LOW);
-
-  // Initialize Receiver on INT0 (PB2)
-  mySwitch.enableReceive(0); 
-  mySerial.println("Receiver Armed on PB2...");
+  Serial.println("--- Wemos Slave Unit Online ---");
+  
+  // Quick startup beep
+  digitalWrite(buzzerPin, HIGH);
+  delay(100);
+  digitalWrite(buzzerPin, LOW);
 }
 
 void loop() {
   if (mySwitch.available()) {
     long value = mySwitch.getReceivedValue();
-    mySerial.print("Signal Caught! Value: ");
-    mySerial.println(value);
-
+    
     if (value == 1001) {
-      mySerial.println("MATCH! Beeping now.");
-      digitalWrite(bzrPin, HIGH);
-      delay(500);
-      digitalWrite(bzrPin, LOW);
+      Serial.println("Signal Received: 1001 - BEEPING!");
+      
+      // Triple-beep pattern
+      for(int i=0; i<3; i++) {
+        digitalWrite(buzzerPin, HIGH);
+        delay(200);
+        digitalWrite(buzzerPin, LOW);
+        delay(100);
+      }
+    } else {
+      Serial.print("Unknown Signal Caught: ");
+      Serial.println(value);
     }
+    
     mySwitch.resetAvailable();
   }
 }
