@@ -1,9 +1,10 @@
 #include <RCSwitch.h>
+#include <ESP8266WiFi.h>
 
 RCSwitch mySwitch = RCSwitch();
 
 // Pin Definitions
-const int buzzerPin = D5;       // Connected to the Base of your P2N2222A transistor
+const int buzzerPin = D5;       // Connected to the Base of your P2N2222A transistor (with 1k resistor)
 const int onboardLED = LED_BUILTIN; // Wemos D1 Mini onboard blue LED (Note: LOW = ON, HIGH = OFF)
 
 // System State Variables
@@ -11,27 +12,35 @@ bool isSleeping = false;
 
 // Non-Blocking Heartbeat Variables
 unsigned long previousMillis = 0;
-const long heartbeatInterval = 1000; // Blink every 1 second
-bool ledState = HIGH;                // Start with LED off (HIGH)
+const long heartbeatInterval = 10000; // Blink every 10 second
 
 void setup() {
   Serial.begin(115200);
   
+  // 2. FORCE THE INTERNAL WI-FI RADIO TO SHUT DOWN COMPLETELY
+  WiFi.disconnect();        // Break any automatic connections
+  WiFi.mode(WIFI_OFF);      // Turn off the internal 2.4GHz radio transceiver
+  WiFi.forceSleepBegin();   // Put the Wi-Fi modem into a deep electronic sleep
+  delay(1);                 // Short pause to let the radio power rail collapse safely
+  
+  Serial.println("Internal Wi-Fi Radio Powered Down permanently.");
+
   // Initialize Pins
   pinMode(buzzerPin, OUTPUT);
   pinMode(onboardLED, OUTPUT);
   
-  digitalWrite(buzzerPin, LOW);     // Ensure buzzer is quiet
-  digitalWrite(onboardLED, HIGH);   // Ensure LED starts off
+  digitalWrite(buzzerPin, LOW);     
+  digitalWrite(onboardLED, HIGH);   
   
-  // Initialize 433MHz Receiver (Connected to D2/Interrupt 0 on Wemos D1 Mini)
+  // Your 433MHz external radio remains fully operational on D2!
   mySwitch.enableReceive(digitalPinToInterrupt(D2));
-  Serial.println("Slave Unit Ready. Monitoring Airwaves...");
+  Serial.println("Slave Unit Ready. Monitoring Airwaves via 433MHz only...");
 
   // Quick startup beep
   digitalWrite(buzzerPin, HIGH);
-  delay(100);
+  delay(500);
   digitalWrite(buzzerPin, LOW);
+  delay(500);
 }
 
 void loop() {
@@ -41,8 +50,9 @@ void loop() {
   if (!isSleeping) {
     if (currentMillis - previousMillis >= heartbeatInterval) {
       previousMillis = currentMillis;
-      ledState = !ledState; // Toggle state
-      digitalWrite(onboardLED, ledState);
+      digitalWrite(onboardLED, LOW);
+      delay(100);
+      digitalWrite(onboardLED, HIGH);
     }
   } else {
     // Force LED off during sleep mode
@@ -107,9 +117,9 @@ void triggerBuzzerAlert() {
   // A three-beep pattern for the door alert
   for (int i = 0; i < 3; i++) {
     digitalWrite(buzzerPin, HIGH);
-    delay(150);
+    delay(500);
     digitalWrite(buzzerPin, LOW);
-    delay(100);
+    delay(500);
   }
 }
 
@@ -117,7 +127,7 @@ void triggerBuzzerAlert() {
 void playStateChime(bool wakingUp) {
   if (wakingUp) {
     // "Good Morning" Ascending Tones
-    for (int duration = 50; duration <= 150; duration += 50) {
+    for (int duration = 50; duration <= 250; duration += 50) {
       digitalWrite(buzzerPin, HIGH);
       delay(duration);
       digitalWrite(buzzerPin, LOW);
@@ -125,7 +135,7 @@ void playStateChime(bool wakingUp) {
     }
   } else {
     // "Goodnight" Descending Tones
-    for (int duration = 150; duration >= 50; duration -= 50) {
+    for (int duration = 250; duration >= 50; duration -= 50) {
       digitalWrite(buzzerPin, HIGH);
       delay(duration);
       digitalWrite(buzzerPin, LOW);
