@@ -1,16 +1,16 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
-#include <WiFiManager.h> // Integrated for dynamic Wi-Fi setup
+#include <WiFiManager.h> 
 #include <WiFiUdp.h>
-#include <NTPClient.h>   // Integrated for automatic sleep schedule
+#include <NTPClient.h>   
 #include <RCSwitch.h> 
 
 RCSwitch mySwitch = RCSwitch();
 
 // --- Configuration & Secret Keys ---
-const String apiKey = "97d26ad5-079e-XXXX-XXXX";
-const String phoneNumber = "91991603XXXXX";
+const String apiKey = "97d26ad5-079e-xxxx-xxxx";
+const String phoneNumber = "91991603xxxx";
 const String messageText = "Knock knock! Someone is at the door.";
 
 // Pin Definitions
@@ -18,12 +18,19 @@ const int sensorPowerBusPin = 5; // D1 - Controls Transistor Base for Sensor Pow
 const int sensorPin = 14;        // D5 - Knock/Vibration Sensor Input
 const int statusLed = 16;        // D0 - Heartbeat/Status LED
 const int rfTransmitPin = 15;    // D8 - 433MHz Transmitter Data
+const int masterButtonPin = 0;   // D3 (GPIO0) - NEW: Physical Manual Test Button
 
 // Timers and Logic
 unsigned long lastTriggerTime = 0;
 const int cooldownTimer = 30000;      // 30 seconds
 unsigned long lastHeartbeat = 0;
 const int heartbeatInterval = 10000;  // 10 seconds
+unsigned long lastNTPCheck = 0;
+const unsigned long ntpInterval = 1000; // Check time once every 1000ms (1 second)
+
+// NEW: Debounce Timer for the Master Test Button
+unsigned long lastButtonPressTime = 0;
+const unsigned long buttonDebounceDelay = 500; // 500ms debounce guard
 
 // NTP Setup (Austin, Texas Time)
 WiFiUDP ntpUDP;
@@ -46,11 +53,8 @@ const int pulseWindow = 70;        // 70ms window for density check
 const int minPulsesForKnock = 8;   // Threshold to filter false positives
 
 void IRAM_ATTR handleSensorPulse() {
-  // Only register pulses if the system is supposed to be awake (Double protection)
-  if (!sentSleepCommand) {
-    pulseCount++;
-    knockDetected = true; 
-  }
+  pulseCount++;
+  knockDetected = true; 
 }
 
 void setup() {
@@ -62,9 +66,16 @@ void setup() {
   
   pinMode(statusLed, OUTPUT);
   pinMode(sensorPin, INPUT_PULLUP); 
+  
+  // NEW: Initialize the Master physical test button with internal pull-up resistor
+  pinMode(masterButtonPin, INPUT_PULLUP);
+  
+  // Attach interrupt initially for daytime boot
   attachInterrupt(digitalPinToInterrupt(sensorPin), handleSensorPulse, FALLING);
 
-  mySwitch.enableTransmit(rfTransmitPin); // Initialize 433MHz on D8
+  // Configure transmitter and increase repetitions to overcome ambient noise
+  mySwitch.enableTransmit(rfTransmitPin); 
+  mySwitch.setRepeatTransmit(12); 
 
   // WiFiManager Setup - Replaces hardcoded Wi-Fi credentials
   WiFiManager wifiManager;
@@ -77,23 +88,23 @@ void setup() {
     ESP.reset();
   }
   
-  Serial.println("\nWiFi connected dynamically!");
+  Serial.println("\nWiFi connected dynamically via Portal!");
   
   // Start the internet clock
   timeClient.begin();
 }
 
 void sendWhatabotPOST() {
-  // 1. Radio Blast to Slave Unit
+  // 1. Radio Blast to Slave Unit (Redundant local backup)
   for(int i = 0; i < 5; i++) {
     mySwitch.send(1001, 24); 
     delay(10); 
   }
 
-  // 2. WhatsApp Notification via Whatabot
+  // 2. WhatsApp Notification via Whatabot API
   isLedActive = true;
   ledStartTime = millis();
-  digitalWrite(statusLed, HIGH);
+  digitalWrite(statusLed, HIGH); // Turn status LED solid during web processing
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
@@ -116,11 +127,78 @@ void sendWhatabotPOST() {
 }
 
 void loop() {
-  // Update NTP Client time tracking
-  timeClient.update();
   unsigned long currentTime = millis();
 
-  // 1. NON-BLOCKING LED HANDLER
+  // =========================================================================
+  // 1. THROTTLED TIME EVALUATION
+  // =========================================================================
+  if (currentTime - lastNTPCheck >= ntpInterval) {
+    lastNTPCheck = currentTime;
+    timeClient.update();
+  }
+  
+  int currentHour = timeClient.getHours();
+
+  // =========================================================================
+  // 2. TOP-OF-LOOP SLEEP GATEKEEPER
+  // =========================================================================
+  if (currentHour == 23 || (currentHour >= 0 && currentHour < 6)) {
+    
+    if (!sentSleepCommand) {
+      Serial.println("11:00 PM Window Active: Entering Stealth Sleep Mode...");
+      detachInterrupt(digitalPinToInterrupt(sensorPin));
+      digitalWrite(sensorPowerBusPin, LOW); 
+      digitalWrite(statusLed, LOW);         
+      
+      mySwitch.send(9999, 24);
+      
+      sentSleepCommand = true;
+      sentWakeCommand = false; 
+    }
+    
+    knockDetected = false;
+    pulseCount = 0;
+    windowStartTime = 0;
+    
+    return; // SHORT-CIRCUIT LOOP: Do absolutely nothing until 6:00 AM
+  } 
+  else {
+    if (!sentWakeCommand) {
+      Serial.println("6:00 AM Window Active: Restoring power and re-arming sensor...");
+      digitalWrite(sensorPowerBusPin, HIGH); 
+      
+      knockDetected = false;
+      pulseCount = 0;
+      windowStartTime = 0;
+      
+      attachInterrupt(digitalPinToInterrupt(sensorPin), handleSensorPulse, FALLING);
+      mySwitch.send(1111, 24);
+      
+      sentWakeCommand = true;
+      sentSleepCommand = false; 
+    }
+  }
+
+  // =========================================================================
+  // 3. DAYTIME ACTIVITIES (Executed only outside the sleep window)
+  // =========================================================================
+
+  // NEW: Manual Test Button Handler (Active LOW)
+  // Allows testing the RF link to the slave immediately without hitting WhatsApp APIs
+  if (digitalRead(masterButtonPin) == LOW) {
+    if (currentTime - lastButtonPressTime >= buttonDebounceDelay) {
+      lastButtonPressTime = currentTime;
+      Serial.println("Master Test Button Pressed! Blasting verification code (1001) to Slave...");
+      
+      // Send 5 quick bursts directly to the Slave unit to guarantee receipt
+      for(int i = 0; i < 5; i++) {
+        mySwitch.send(1001, 24); 
+        delay(10); 
+      }
+    }
+  }
+
+  // Non-blocking solid LED processing window handler
   if (isLedActive) {
     if (currentTime - ledStartTime >= processingWindow) {
       digitalWrite(statusLed, LOW);
@@ -128,9 +206,9 @@ void loop() {
     }
   }
 
-  // 2. HEARTBEAT LED (Flashes quickly if connected and system is awake)
+  // Daytime Heartbeat LED (50ms clean flash every 10 seconds)
   if (!isLedActive && (currentTime - lastHeartbeat > heartbeatInterval)) {
-    if (WiFi.status() == WL_CONNECTED && !sentSleepCommand) {
+    if (WiFi.status() == WL_CONNECTED) {
       digitalWrite(statusLed, HIGH);
       delay(50); 
       digitalWrite(statusLed, LOW);
@@ -138,46 +216,8 @@ void loop() {
     lastHeartbeat = currentTime;
   }
 
-  // 3. SLEEP SCHEDULE LOGIC CONTROLLER
-  int currentHour = timeClient.getHours();
-  int currentMinute = timeClient.getMinutes();
-
-  // 11:00 PM (23:00) -> Cut Power Bus and Send Radio Sleep Command
-  if (currentHour == 23 && currentMinute == 0) {
-    if (!sentSleepCommand) {
-      Serial.println("11:00 PM: Cutting power to sensor bus & muting slave unit...");
-      digitalWrite(sensorPowerBusPin, LOW); // Transistor turns off -> Kills the green LED!
-      
-      // Blast sleep command to slave
-      for(int i = 0; i < 5; i++) {
-        mySwitch.send(9999, 24);
-        delay(10);
-      }
-      
-      sentSleepCommand = true;
-      sentWakeCommand = false;
-    }
-  }
-
-  // 6:00 AM (06:00) -> Restore Power Bus and Send Radio Wake Command
-  if (currentHour == 6 && currentMinute == 0) {
-    if (!sentWakeCommand) {
-      Serial.println("6:00 AM: Restoring power to sensor bus & waking up slave unit...");
-      digitalWrite(sensorPowerBusPin, HIGH); // Transistor turns on -> Sensor power rail alive
-      
-      // Blast wake command to slave
-      for(int i = 0; i < 5; i++) {
-        mySwitch.send(1111, 24);
-        delay(10);
-      }
-      
-      sentWakeCommand = true;
-      sentSleepCommand = false;
-    }
-  }
-
-  // 4. KNOCK DETECTION WITH PULSE DENSITY FILTER (Only processes if awake)
-  if (knockDetected && !sentSleepCommand) {
+  // Knock Detection with Pulse Density Filter
+  if (knockDetected) {
     if (windowStartTime == 0) {
       windowStartTime = currentTime;
     }
@@ -191,7 +231,6 @@ void loop() {
         lastTriggerTime = currentTime;
       }
 
-      // Reset density evaluation states
       pulseCount = 0;
       knockDetected = false;
       windowStartTime = 0;
