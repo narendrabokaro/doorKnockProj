@@ -13,12 +13,16 @@ const String apiKey = "97d26ad5-079e-xxxx-xxxx";
 const String phoneNumber = "91991603xxxx";
 const String messageText = "Knock knock! Someone is at the door.";
 
+// --- NEW: Quiet Hours Configuration (24-Hour Format) ---
+const int sleepHour = 23;        // 11:00 PM - Enter Stealth Sleep Mode
+const int wakeHour = 6;          // 6:00 AM  - Restore Power and Re-arm
+
 // Pin Definitions
 const int sensorPowerBusPin = 5; // D1 - Controls Transistor Base for Sensor Power/GND Bus
 const int sensorPin = 14;        // D5 - Knock/Vibration Sensor Input
 const int statusLed = 16;        // D0 - Heartbeat/Status LED
 const int rfTransmitPin = 15;    // D8 - 433MHz Transmitter Data
-const int masterButtonPin = 0;   // D3 (GPIO0) - NEW: Physical Manual Test Button
+const int masterButtonPin = 0;   // D3 (GPIO0) - Physical Manual Test Button
 
 // Timers and Logic
 unsigned long lastTriggerTime = 0;
@@ -28,7 +32,7 @@ const int heartbeatInterval = 10000;  // 10 seconds
 unsigned long lastNTPCheck = 0;
 const unsigned long ntpInterval = 1000; // Check time once every 1000ms (1 second)
 
-// NEW: Debounce Timer for the Master Test Button
+// Debounce Timer for the Master Test Button
 unsigned long lastButtonPressTime = 0;
 const unsigned long buttonDebounceDelay = 500; // 500ms debounce guard
 
@@ -45,12 +49,18 @@ bool isLedActive = false;
 unsigned long ledStartTime = 0;
 const unsigned long processingWindow = 5000; // 5 seconds solid LED
 
-// Interrupt & Density Variables
+// Interrupt & Density Variables (HIGH SENSITIVITY CONFIG)
 volatile bool knockDetected = false;
 volatile int pulseCount = 0;
 unsigned long windowStartTime = 0; 
-const int pulseWindow = 70;        // 70ms window for density check
-const int minPulsesForKnock = 8;   // Threshold to filter false positives
+const int pulseWindow = 120;        // Open window to catch light, slow vibrations
+const int minPulsesForKnock = 4;   // Low threshold to capture subtle taps
+
+// Environmental Noise Pattern Filtering Variables
+int detectedPacketCount = 0;       // Tracks how many distinct knock bursts have occurred
+unsigned long firstPacketTime = 0;   // Timestamp of the first validated burst
+const unsigned long packetResetWindow = 1500; // 1.5 seconds to complete a multi-tap knock pattern
+unsigned long packetIntermissionTimeout = 0; // Guard to separate distinct taps
 
 void IRAM_ATTR handleSensorPulse() {
   pulseCount++;
@@ -62,35 +72,30 @@ void setup() {
   
   // Initialize Pins
   pinMode(sensorPowerBusPin, OUTPUT);
-  digitalWrite(sensorPowerBusPin, HIGH); // Turn on power bus immediately at boot
+  digitalWrite(sensorPowerBusPin, HIGH); 
   
   pinMode(statusLed, OUTPUT);
   pinMode(sensorPin, INPUT_PULLUP); 
-  
-  // NEW: Initialize the Master physical test button with internal pull-up resistor
   pinMode(masterButtonPin, INPUT_PULLUP);
   
-  // Attach interrupt initially for daytime boot
   attachInterrupt(digitalPinToInterrupt(sensorPin), handleSensorPulse, FALLING);
 
-  // Configure transmitter and increase repetitions to overcome ambient noise
   mySwitch.enableTransmit(rfTransmitPin); 
   mySwitch.setRepeatTransmit(12); 
 
-  // WiFiManager Setup - Replaces hardcoded Wi-Fi credentials
+  // WiFiManager Setup
   WiFiManager wifiManager;
+  wifiManager.setConfigPortalTimeout(180);
+  
   Serial.println("Connecting to Wi-Fi via WiFiManager...");
   
-  // If it can't find saved credentials, it opens an AP named "KnockMaster-Setup"
   if (!wifiManager.autoConnect("KnockMaster-Setup")) {
-    Serial.println("Failed to connect and hit timeout. Resetting MCU...");
+    Serial.println("Failed to connect or portal timed out. Resetting MCU to retry...");
     delay(3000);
     ESP.reset();
   }
   
   Serial.println("\nWiFi connected dynamically via Portal!");
-  
-  // Start the internet clock
   timeClient.begin();
 }
 
@@ -104,7 +109,7 @@ void sendWhatabotPOST() {
   // 2. WhatsApp Notification via Whatabot API
   isLedActive = true;
   ledStartTime = millis();
-  digitalWrite(statusLed, HIGH); // Turn status LED solid during web processing
+  digitalWrite(statusLed, HIGH); 
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
@@ -142,55 +147,47 @@ void loop() {
   // =========================================================================
   // 2. TOP-OF-LOOP SLEEP GATEKEEPER
   // =========================================================================
-  if (currentHour == 23 || (currentHour >= 0 && currentHour < 6)) {
-    
+  // Dynamically uses variables defined at the top
+  if (currentHour == sleepHour || (currentHour >= 0 && currentHour < wakeHour)) {
     if (!sentSleepCommand) {
-      Serial.println("11:00 PM Window Active: Entering Stealth Sleep Mode...");
+      Serial.printf("%02d:00 Window Active: Entering Stealth Sleep Mode...\n", sleepHour);
       detachInterrupt(digitalPinToInterrupt(sensorPin));
       digitalWrite(sensorPowerBusPin, LOW); 
       digitalWrite(statusLed, LOW);         
-      
       mySwitch.send(9999, 24);
-      
       sentSleepCommand = true;
       sentWakeCommand = false; 
     }
-    
     knockDetected = false;
     pulseCount = 0;
     windowStartTime = 0;
-    
-    return; // SHORT-CIRCUIT LOOP: Do absolutely nothing until 6:00 AM
+    detectedPacketCount = 0;
+    return; 
   } 
   else {
     if (!sentWakeCommand) {
-      Serial.println("6:00 AM Window Active: Restoring power and re-arming sensor...");
+      Serial.printf("%02d:00 Window Active: Restoring power and re-arming sensor...\n", wakeHour);
       digitalWrite(sensorPowerBusPin, HIGH); 
-      
       knockDetected = false;
       pulseCount = 0;
       windowStartTime = 0;
-      
+      detectedPacketCount = 0;
       attachInterrupt(digitalPinToInterrupt(sensorPin), handleSensorPulse, FALLING);
       mySwitch.send(1111, 24);
-      
       sentWakeCommand = true;
       sentSleepCommand = false; 
     }
   }
 
   // =========================================================================
-  // 3. DAYTIME ACTIVITIES (Executed only outside the sleep window)
+  // 3. DAYTIME ACTIVITIES 
   // =========================================================================
 
-  // NEW: Manual Test Button Handler (Active LOW)
-  // Allows testing the RF link to the slave immediately without hitting WhatsApp APIs
+  // Manual Test Button Handler (Active LOW)
   if (digitalRead(masterButtonPin) == LOW) {
     if (currentTime - lastButtonPressTime >= buttonDebounceDelay) {
       lastButtonPressTime = currentTime;
       Serial.println("Master Test Button Pressed! Blasting verification code (1001) to Slave...");
-      
-      // Send 5 quick bursts directly to the Slave unit to guarantee receipt
       for(int i = 0; i < 5; i++) {
         mySwitch.send(1001, 24); 
         delay(10); 
@@ -216,19 +213,37 @@ void loop() {
     lastHeartbeat = currentTime;
   }
 
-  // Knock Detection with Pulse Density Filter
+  // Reset multi-tap evaluation sequence if the 1.5-second human intent window expires
+  if (detectedPacketCount > 0 && (currentTime - firstPacketTime > packetResetWindow)) {
+    Serial.println("Pattern Expired: Isolated environmental noise or single vibration dropped.");
+    detectedPacketCount = 0;
+  }
+
+  // Knock Detection with Multi-Packet Behavioral Filter
   if (knockDetected) {
     if (windowStartTime == 0) {
       windowStartTime = currentTime;
     }
 
     if (currentTime - windowStartTime >= pulseWindow) {
-      Serial.printf("Pulses detected: %d\n", pulseCount);
-
       if (pulseCount >= minPulsesForKnock && (currentTime - lastTriggerTime > cooldownTimer)) {
-        Serial.println("Density Verified: Valid Knock Burst!");
-        sendWhatabotPOST();
-        lastTriggerTime = currentTime;
+        
+        if (currentTime > packetIntermissionTimeout) {
+          detectedPacketCount++;
+          packetIntermissionTimeout = currentTime + 150; 
+          
+          if (detectedPacketCount == 1) {
+            firstPacketTime = currentTime; 
+            Serial.println("First light tap signature caught! Waiting for companion tap...");
+          }
+          
+          if (detectedPacketCount >= 2) {
+            Serial.printf("Pattern Verified: %d distinct light taps detected! Valid Human Knock.\n", detectedPacketCount);
+            sendWhatabotPOST();
+            lastTriggerTime = currentTime;
+            detectedPacketCount = 0; 
+          }
+        }
       }
 
       pulseCount = 0;
