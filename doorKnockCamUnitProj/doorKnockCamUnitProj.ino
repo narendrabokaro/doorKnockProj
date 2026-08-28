@@ -1,13 +1,12 @@
 #include "esp_camera.h"
 #include "Arduino.h"
 
-// Hardware Pin Definitions for AI THINKER ESP32-CAM
+// AI-THINKER ESP32-CAM Pin Definitions
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
 #define SIOC_GPIO_NUM     27
-
 #define Y9_GPIO_NUM       35
 #define Y8_GPIO_NUM       34
 #define Y7_GPIO_NUM       39
@@ -20,29 +19,24 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Trigger Pin from PCF8574 (P3)
-#define TRIGGER_PIN       13 
+// Hardware Interfaces
+#define TRIGGER_PIN       13  // Connect to PCF8574 P3
+#define FLASH_LED_PIN      4  // Onboard bright white LED
 
-// Onboard Flash LED Pin
-#define FLASH_LED_PIN      4
+volatile bool captureRequested = false;
 
-volatile bool snapPhotoRequested = false;
-
-// Interrupt handler when P3 pulses LOW
-void IRAM_ATTR photoTriggerISR() {
-  snapPhotoRequested = true;
+void IRAM_ATTR triggerISR() {
+  captureRequested = true;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== ESP32-CAM Security Receiver (With Flash) ===");
+  Serial.println("\n--- ESP32-CAM Ready for Trigger ---");
 
-  // Set Flash LED pin as output and turn it OFF initially
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW);
 
-  // 1. Configure Camera Parameters
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -64,39 +58,33 @@ void setup() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-
-  config.frame_size   = FRAMESIZE_SVGA;
-  config.jpeg_quality = 12; 
+  config.frame_size   = FRAMESIZE_VGA;  // 640x480 (optimal for messaging gateways)
+  config.jpeg_quality = 12;
   config.fb_count     = 1;
 
-  // 2. Initialize Camera Hardware
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed!");
     return;
   }
-  Serial.println("Camera Initialized Successfully!");
+  Serial.println("Camera Initialized!");
 
-  // 3. Attach Hardware Interrupt to GPIO 13 (Trigger line P3)
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), photoTriggerISR, FALLING);
-
-  Serial.println("Ready! Waiting for P3 trigger pulse...");
+  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
 }
 
 void loop() {
-  if (snapPhotoRequested) {
-    snapPhotoRequested = false;
-    Serial.println("SIGNAL RECEIVED: Flashing LED & Snapping Photo...");
+  if (captureRequested) {
+    captureRequested = false;
+    Serial.println("\nTrigger received! Capturing photo...");
 
-    // TURN ON FLASH LED
+    // Turn ON flash LED
     digitalWrite(FLASH_LED_PIN, HIGH);
-    delay(50); // Small pause so the light illuminates the scene before exposure
+    delay(40);
 
-    // Grab frame from camera sensor
+    // Capture frame buffer
     camera_fb_t * fb = esp_camera_fb_get();
 
-    // TURN OFF FLASH LED immediately after exposure
+    // Turn OFF flash LED
     digitalWrite(FLASH_LED_PIN, LOW);
 
     if (!fb) {
@@ -104,9 +92,9 @@ void loop() {
       return;
     }
 
-    Serial.printf("Photo Captured with Flash! Size: %u bytes\n", fb->len);
+    Serial.printf("Photo Captured! Size: %u bytes (%dx%d)\n", fb->len, fb->width, fb->height);
 
-    // Free frame buffer memory
+    // Return the frame buffer to free memory
     esp_camera_fb_return(fb);
   }
 }

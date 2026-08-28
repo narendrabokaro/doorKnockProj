@@ -1,127 +1,111 @@
 #include <Wire.h>
 
-// --- PIN DEFINITIONS (Wemos D1 Mini) ---
-#define MASTER_SDA    13  // D7 pin on Wemos D1 Mini
-#define MASTER_SCL    14  // D5 pin on Wemos D1 Mini
-#define INT_PIN       12  // D6 pin on Wemos D1 Mini (Interrupt line)
-#define BUZZER_PIN    4   // D2 pin on Wemos D1 Mini
+#define PCF_ADDRESS 0x20
+#define SDA_PIN     D5  
+#define SCL_PIN     D7  
+#define INT_PIN     D2  
 
-// --- PCF8574 CONFIGURATION ---
-#define PCF_I2C_ADDR  0x20 // Change to 0x38 if your PCF8574AT chip uses 0x38
+#define BUTTON_PIN      0   // P0
+#define LED_PIN         1   // P1
+#define BUZZER_PIN      2   // P2
+#define CAM_TRIGGER_PIN 3   // P3 -> Connect to ESP32-CAM GPIO 13
 
-// PCF8574 Pin Map
-#define PCF_P0_DOORBELL  0
-#define PCF_P1_PIR       1
-#define PCF_P2_LED       2
-#define PCF_P3_CAM       3
+volatile bool interruptTriggered = false;
 
-// --- TIMING CONSTANTS ---
-#define LOITERING_THRESHOLD 8000 // 8 seconds of persistent motion triggers camera
-#define CAM_PULSE_DURATION  50   // 50ms LOW pulse on P3 to trigger camera
+// 1 = INPUT mode -OR- Output OFF
+// 0 = Output ON (Sinking to GND)
+uint8_t expanderState = 0xFF; 
 
-// Global State
-uint8_t pcfOutputState = 0xFF; // All pins HIGH by default
-unsigned long motionStartTime = 0;
-bool isLoiteringTriggered = false;
-
-// --- I2C HELPER FUNCTIONS ---
-void writePCF(uint8_t data) {
-  pcfOutputState = data;
-  Wire.beginTransmission(PCF_I2C_ADDR);
-  Wire.write(pcfOutputState);
-  Wire.endTransmission();
-}
-
-uint8_t readPCF() {
-  Wire.requestFrom(PCF_I2C_ADDR, 1);
-  if (Wire.available()) {
-    return Wire.read();
-  }
-  return 0xFF;
-}
-
-void triggerCamera() {
-  Serial.println("LOITERING DETECTED! Pulse P3 LOW -> ESP32-CAM Trigger");
-  
-  // Set P3 LOW while preserving other output pin states
-  uint8_t pulseLow = pcfOutputState & ~(1 << PCF_P3_CAM);
-  writePCF(pulseLow);
-  delay(CAM_PULSE_DURATION);
-  
-  // Return P3 to HIGH
-  uint8_t pulseHigh = pcfOutputState | (1 << PCF_P3_CAM);
-  writePCF(pulseHigh);
-}
-
-void playChime() {
-  tone(BUZZER_PIN, 1046, 150); // High note (C6)
-  delay(180);
-  tone(BUZZER_PIN, 784, 300);  // Low note (G5)
-  delay(320);
-  noTone(BUZZER_PIN);
+IRAM_ATTR void handleInterrupt() {
+  interruptTriggered = true;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== Master Porch Security Control Hub Initializing ===");
+  delay(2000); 
+  Serial.println("\n--- PCF8574 Doorbell & ESP32-CAM Trigger ---");
 
-  pinMode(BUZZER_PIN, OUTPUT);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
   pinMode(INT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(INT_PIN), handleInterrupt, FALLING);
 
-  Wire.begin(MASTER_SDA, MASTER_SCL);
+  // Send the initial state (all high/off)
+  Wire.beginTransmission(PCF_ADDRESS);
+  Wire.write(expanderState); 
+  Wire.endTransmission();
+  
+  // Dummy read to clear startup triggers
+  Wire.requestFrom(PCF_ADDRESS, 1);
+  if (Wire.available()) {
+    Wire.read();
+  }
+  
+  Serial.println("System Ready. Press the button on P0...");
+}
 
-  // Initialize PCF8574 outputs HIGH (LED off, CAM line HIGH)
-  writePCF(0xFF);
+void triggerAlert() {
+  Serial.println("Executing Alert Sequence & Triggering ESP32-CAM...");
 
-  Serial.println("Hardware Ready. Monitoring Porch inputs...");
+  // 1. Send active-LOW pulse to ESP32-CAM (P3 = 0)
+  expanderState &= ~(1 << CAM_TRIGGER_PIN);
+  Wire.beginTransmission(PCF_ADDRESS);
+  Wire.write(expanderState);
+  Wire.endTransmission();
+  
+  delay(50); // Pulse width
+
+  // Release trigger (P3 = 1)
+  expanderState |= (1 << CAM_TRIGGER_PIN);
+  Wire.beginTransmission(PCF_ADDRESS);
+  Wire.write(expanderState);
+  Wire.endTransmission();
+
+  // 2. Flash LED and sound Buzzer 3 times
+  for (int i = 0; i < 3; i++) {
+    // Turn ON: Clear bits to 0
+    expanderState &= ~(1 << LED_PIN);
+    expanderState &= ~(1 << BUZZER_PIN);
+    Wire.beginTransmission(PCF_ADDRESS);
+    Wire.write(expanderState);
+    Wire.endTransmission();
+    
+    delay(150); // ON duration
+    
+    // Turn OFF: Set bits to 1
+    expanderState |= (1 << LED_PIN);
+    expanderState |= (1 << BUZZER_PIN);
+    Wire.beginTransmission(PCF_ADDRESS);
+    Wire.write(expanderState);
+    Wire.endTransmission();
+    
+    delay(150); // OFF duration
+  }
 }
 
 void loop() {
-  uint8_t inputs = readPCF();
-
-  bool doorbellPressed = !(inputs & (1 << PCF_P0_DOORBELL)); // Active LOW
-  bool motionDetected  = (inputs & (1 << PCF_P1_PIR));        // Active HIGH
-
-  // 1. DOORBELL EVENT HANDLING
-  if (doorbellPressed) {
-    Serial.println("Doorbell Pressed!");
-    
-    // Turn ON LED (P2 LOW) and trigger immediate camera capture
-    writePCF(pcfOutputState & ~(1 << PCF_P2_LED)); 
-    playChime();
-    triggerCamera();
-    
-    // Turn OFF LED
-    writePCF(pcfOutputState | (1 << PCF_P2_LED));
-    delay(1000); // Debounce delay
+  // Watchdog check
+  if (digitalRead(INT_PIN) == LOW && !interruptTriggered) {
+    interruptTriggered = true; 
   }
 
-  // 2. PIR LOITERING DETECTION LOGIC
-  if (motionDetected) {
-    if (motionStartTime == 0) {
-      motionStartTime = millis();
-      Serial.println("Motion detected. Starting loiter timer...");
-    } else if ((millis() - motionStartTime >= LOITERING_THRESHOLD) && !isLoiteringTriggered) {
-      isLoiteringTriggered = true;
+  if (interruptTriggered) {
+    delay(50); // Debounce
+    
+    Wire.requestFrom(PCF_ADDRESS, 1);
+    if (Wire.available()) {
+      uint8_t portState = Wire.read();
       
-      // Blink LED and trigger camera
-      for(int i=0; i<3; i++) {
-        writePCF(pcfOutputState & ~(1 << PCF_P2_LED));
-        delay(100);
-        writePCF(pcfOutputState | (1 << PCF_P2_LED));
-        delay(100);
-      }
-      triggerCamera();
-    }
-  } else {
-    // Reset motion timer when subject walks away
-    if (motionStartTime != 0) {
-      Serial.println("Clear. Motion stopped.");
-    }
-    motionStartTime = 0;
-    isLoiteringTriggered = false;
-  }
+      bool isPressed = !(portState & (1 << BUTTON_PIN));
 
-  delay(50); // Polling loop speed
+      if (isPressed) {
+        Serial.println("Button PRESSED!");
+        triggerAlert();
+      } else {
+        Serial.println("Button released.");
+      }
+    }
+    
+    interruptTriggered = false;
+  }
 }
