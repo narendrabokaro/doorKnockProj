@@ -68,8 +68,31 @@
  * ============================================================================
 */
 
+/**
+ * ============================================================================
+ * Project: Smart Porch Security Hub - Edge Vision Node
+ * Board: AI-Thinker ESP32-CAM (or ESP32 Dev Module with PSRAM: Enabled)
+ * Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)
+ * ============================================================================
+ * 
+ * Hardware Connections:
+ * - GPIO 13 (IO13) : Hardware Trigger Input from Master PCF8574 P3 (Active-LOW pulse)
+ * - GPIO 4  (IO4)  : Onboard High-Power White Flash LED (Clean DC control)
+ * - 5V / GND       : Stable 5V (>= 2A) & Shared Ground with Master Node
+ */
+
+
 #include "esp_camera.h"
-#include "Arduino.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+// ================= USER CONFIGURATION =================
+const char* ssid     = "<your wifi>";
+const char* password = "<your wifi password>";
+
+const char* botToken = "<your API Key>";
+const char* chatID   = "<your password>";
+// ======================================================
 
 // AI-THINKER ESP32-CAM Pin Definitions
 #define PWDN_GPIO_NUM     32
@@ -90,23 +113,17 @@
 #define PCLK_GPIO_NUM     22
 
 // Hardware Interfaces
-#define TRIGGER_PIN       13  // Connect to PCF8574 P3
-#define FLASH_LED_PIN      4  // Onboard bright white LED
+#define TRIGGER_PIN       13  // From PCF8574 P3
+#define FLASH_LED_PIN      4  // Onboard Flash LED
 
-volatile bool captureRequested = false;
+volatile bool captureTriggered = false;
 
+// Interrupt Service Routine for Doorbell Trigger
 void IRAM_ATTR triggerISR() {
-  captureRequested = true;
+  captureTriggered = true;
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n--- ESP32-CAM Ready for Trigger ---");
-
-  pinMode(FLASH_LED_PIN, OUTPUT);
-  digitalWrite(FLASH_LED_PIN, LOW);
-
+void initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -126,45 +143,222 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
+  
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;  // 640x480 (optimal for messaging gateways)
+  config.frame_size   = FRAMESIZE_VGA;  // 640x480
   config.jpeg_quality = 12;
-  config.fb_count     = 1;
+  config.fb_count     = 2;              // Double buffering via PSRAM
+  config.grab_mode    = CAMERA_GRAB_LATEST;
 
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("Camera init failed!");
     return;
   }
-  Serial.println("Camera Initialized!");
 
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_agc_gain(s, 0);
+    s->set_raw_gma(s, 1);
+    s->set_lenc(s, 1);
+  }
+  Serial.println("Camera Initialized & Configured with PSRAM!");
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.printf("\nConnecting to Wi-Fi: %s", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.printf("\nWi-Fi Connection Failed! Status: %d\n", WiFi.status());
+  }
+}
+
+// Single HTTPS Request: Streams raw JPEG with alert caption
+bool sendTelegramPhoto(camera_fb_t* fb) {
+  if (WiFi.status() != WL_CONNECTED || !fb) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(12000);
+
+  Serial.println("Connecting to api.telegram.org...");
+  if (!client.connect("api.telegram.org", 443)) {
+    Serial.println("Telegram connection failed!");
+    return false;
+  }
+
+  String boundary = "PorchCamBoundary7MA4YWxkTrZu0gW";
+  String head = "--" + boundary + "\r\n"
+              + "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+              + String(chatID) + "\r\n"
+              + "--" + boundary + "\r\n"
+              + "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
+              + " Porch Alert: Doorbell button pressed!\r\n"
+              + "--" + boundary + "\r\n"
+              + "Content-Disposition: form-data; name=\"photo\"; filename=\"visitor.jpg\"\r\n"
+              + "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+  size_t totalLen = head.length() + fb->len + tail.length();
+
+  client.println("POST /bot" + String(botToken) + "/sendPhoto HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Content-Length: " + String(totalLen));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Connection: close");
+  client.println();
+
+  // Send multipart head
+  client.print(head);
+
+  // Stream raw JPEG bytes in 1024-byte chunks
+  uint8_t *buf = fb->buf;
+  size_t len = fb->len;
+  size_t chunkSize = 1024;
+  for (size_t i = 0; i < len; i += chunkSize) {
+    if (i + chunkSize < len) {
+      client.write(buf + i, chunkSize);
+    } else {
+      client.write(buf + i, len - i);
+    }
+  }
+
+  // Send multipart tail
+  client.print(tail);
+
+  // Await Telegram response
+  unsigned long timeout = millis();
+  bool success = false;
+  while (client.connected() || client.available()) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line.indexOf("200 OK") > 0) {
+        success = true;
+      }
+    }
+    if (millis() - timeout > 6000) break;
+  }
+  client.stop();
+
+  if (success) {
+    Serial.println("Photo & caption delivered successfully!");
+  } else {
+    Serial.println("Warning: Upload finished without confirming HTTP 200.");
+  }
+  return success;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Smart Porch Security Hub: Fast Edge Vision Node ===");
+
+  // Verify PSRAM state
+  if (psramFound()) {
+    Serial.printf("PSRAM Enabled! Total Free: %d bytes\n", ESP.getFreePsram());
+  } else {
+    Serial.println("Warning: PSRAM flag is not active! Enable in Tools menu.");
+  }
+
+  // Configure clean DC Flash pin
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  // Initialize Camera Hardware
+  initCamera();
+
+  // Connect to Wi-Fi
+  connectWiFi();
+
+  // Sensor warm-up: discard initial startup frames
+  Serial.println("Stabilizing sensor registers...");
+  for (int i = 0; i < 4; i++) {
+    camera_fb_t * dummy = esp_camera_fb_get();
+    if (dummy) {
+      esp_camera_fb_return(dummy);
+    }
+    delay(80);
+  }
+  Serial.println("Sensor ready!");
+
+  // Hardware interrupt trigger from PCF8574 P3
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
+
+  Serial.println("System Armed! Waiting for Doorbell trigger on GPIO 13...\n");
 }
 
 void loop() {
-  if (captureRequested) {
-    captureRequested = false;
-    Serial.println("\nTrigger received! Capturing photo...");
+  if (captureTriggered) {
+    captureTriggered = false;
+    Serial.println("\nINSTANT DOORBELL TRIGGER DETECTED!");
 
-    // Turn ON flash LED
+    // ==========================================================
+    // PHASE 1: IMMEDIATE OPTICAL CAPTURE (~150ms total)
+    // ==========================================================
     digitalWrite(FLASH_LED_PIN, HIGH);
-    delay(40);
+    delay(60); // Exposure lock settling time
 
-    // Capture frame buffer
-    camera_fb_t * fb = esp_camera_fb_get();
-
-    // Turn OFF flash LED
-    digitalWrite(FLASH_LED_PIN, LOW);
-
-    if (!fb) {
-      Serial.println("Camera capture failed!");
-      return;
+    // Flush stale unlit frame
+    camera_fb_t * stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
     }
 
-    Serial.printf("Photo Captured! Size: %u bytes (%dx%d)\n", fb->len, fb->width, fb->height);
+    // Capture the illuminated visitor
+    camera_fb_t * fb = esp_camera_fb_get();
 
-    // Return the frame buffer to free memory
-    esp_camera_fb_return(fb);
+    // Turn flash OFF immediately
+    digitalWrite(FLASH_LED_PIN, LOW);
+
+    // ==========================================================
+    // PHASE 2: SECURE CLOUD DISPATCH
+    // ==========================================================
+    if (fb) {
+      Serial.printf("Frame secured: %u bytes (%dx%d). Uploading with caption...\n", 
+                    fb->len, fb->width, fb->height);
+
+      // Verify network link
+      if (WiFi.status() != WL_CONNECTED) {
+        connectWiFi();
+      }
+
+      // Upload image + caption directly
+      sendTelegramPhoto(fb);
+
+      // Free buffer back to PSRAM pool
+      esp_camera_fb_return(fb);
+    } else {
+      Serial.println("Camera capture failed!");
+    }
+
+    Serial.println("Complete. Re-armed and standing by.\n");
   }
 }
