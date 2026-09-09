@@ -58,9 +58,15 @@
 
 #define ONBOARD_LED     LED_BUILTIN // GPIO 2 (Active LOW on Wemos D1 Mini)
 
-// Cooldown timing
+// Doorbell Cooldown Timing
 const unsigned long COOLDOWN_INTERVAL_MS = 3000;
 unsigned long lastTriggerTime = 0;
+
+// Non-blocking Heartbeat Timing
+const unsigned long HEARTBEAT_INTERVAL_MS = 1500; // Time between blinks
+const unsigned long HEARTBEAT_PULSE_MS    = 50;   // Blink duration
+unsigned long lastHeartbeatTime = 0;
+bool heartbeatState = false;
 
 volatile bool interruptTriggered = false;
 
@@ -83,9 +89,9 @@ void runStartupDiagnostics() {
 
   // Phase 1: Rapid triple blink on onboard Wemos LED
   for (int i = 0; i < 3; i++) {
-    digitalWrite(ONBOARD_LED, LOW);
+    digitalWrite(ONBOARD_LED, LOW);  // ON
     delay(70);
-    digitalWrite(ONBOARD_LED, HIGH);
+    digitalWrite(ONBOARD_LED, HIGH); // OFF
     delay(70);
   }
 
@@ -136,18 +142,38 @@ void triggerAlert() {
   }
 }
 
+// Non-blocking Heartbeat routine
+void handleHeartbeat() {
+  unsigned long currentMillis = millis();
+
+  if (!heartbeatState) {
+    // Check if it's time to turn the LED ON
+    if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeatTime = currentMillis;
+      digitalWrite(ONBOARD_LED, LOW); // Active-LOW: Turn LED ON
+      heartbeatState = true;
+    }
+  } else {
+    // Check if the 50ms flash duration has elapsed
+    if (currentMillis - lastHeartbeatTime >= HEARTBEAT_PULSE_MS) {
+      digitalWrite(ONBOARD_LED, HIGH); // Turn LED OFF
+      heartbeatState = false;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== Smart Porch Security Hub: Master Controller ===");
 
-  // Power down Wi-Fi radio completely
+  // Power down Wi-Fi radio completely to save power & remove RF noise
   WiFi.mode(WIFI_OFF);
   WiFi.forceSleepBegin();
   delay(1);
 
   pinMode(ONBOARD_LED, OUTPUT);
-  digitalWrite(ONBOARD_LED, HIGH);
+  digitalWrite(ONBOARD_LED, HIGH); // Default OFF (active LOW)
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
@@ -166,6 +192,10 @@ void setup() {
 }
 
 void loop() {
+  // Service non-blocking heartbeat LED
+  handleHeartbeat();
+
+  // Watchdog backup check in case falling edge was missed
   if (digitalRead(INT_PIN) == LOW && !interruptTriggered) {
     interruptTriggered = true; 
   }
@@ -183,6 +213,10 @@ void loop() {
         if (millis() - lastTriggerTime >= COOLDOWN_INTERVAL_MS) {
           lastTriggerTime = millis();
           triggerAlert();
+          // Reset heartbeat tracking so it doesn't immediately glitch after alert
+          lastHeartbeatTime = millis();
+          digitalWrite(ONBOARD_LED, HIGH);
+          heartbeatState = false;
         } else {
           Serial.println("Doorbell press ignored (Cooldown window active).");
         }
