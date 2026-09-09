@@ -63,7 +63,7 @@ const unsigned long COOLDOWN_INTERVAL_MS = 3000;
 unsigned long lastTriggerTime = 0;
 
 // Non-blocking Heartbeat Timing
-const unsigned long HEARTBEAT_INTERVAL_MS = 1500; // Time between blinks
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // Time between blinks
 const unsigned long HEARTBEAT_PULSE_MS    = 50;   // Blink duration
 unsigned long lastHeartbeatTime = 0;
 bool heartbeatState = false;

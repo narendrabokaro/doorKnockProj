@@ -81,7 +81,6 @@
  * - 5V / GND       : Stable 5V (>= 2A) & Shared Ground with Master Node
  */
 
-
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -113,12 +112,15 @@ const char* chatID   = "<your password>";
 #define PCLK_GPIO_NUM     22
 
 // Hardware Interfaces
-#define TRIGGER_PIN       13  // From PCF8574 P3
-#define FLASH_LED_PIN      4  // Onboard Flash LED
+#define TRIGGER_PIN       13  // Connect to PCF8574 P3 with pull-up to 3.3V
+#define FLASH_LED_PIN      4  // Onboard White Flash LED
+
+// Camera Cooldown Guard
+const unsigned long CAM_COOLDOWN_MS = 3500;
+unsigned long lastCaptureTimestamp = 0;
 
 volatile bool captureTriggered = false;
 
-// Interrupt Service Routine for Doorbell Trigger
 void IRAM_ATTR triggerISR() {
   captureTriggered = true;
 }
@@ -148,7 +150,7 @@ void initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_VGA;  // 640x480
   config.jpeg_quality = 12;
-  config.fb_count     = 2;              // Double buffering via PSRAM
+  config.fb_count     = 2;              // PSRAM double buffering
   config.grab_mode    = CAMERA_GRAB_LATEST;
 
   if (esp_camera_init(&config) != ESP_OK) {
@@ -200,7 +202,45 @@ void connectWiFi() {
   }
 }
 
-// Single HTTPS Request: Streams raw JPEG with alert caption
+bool sendTelegramBootAlert(const String& message) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8000);
+
+  if (!client.connect("api.telegram.org", 443)) {
+    Serial.println("Telegram boot ping connection failed!");
+    return false;
+  }
+
+  String encodedMsg = "";
+  for (size_t i = 0; i < message.length(); i++) {
+    char c = message.charAt(i);
+    if (isalnum(c)) encodedMsg += c;
+    else if (c == ' ') encodedMsg += "%20";
+    else {
+      char hex[4];
+      sprintf(hex, "%%%02X", (uint8_t)c);
+      encodedMsg += hex;
+    }
+  }
+
+  String url = "/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + encodedMsg;
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: api.telegram.org\r\n" +
+               "Connection: close\r\n\r\n");
+
+  unsigned long timeout = millis();
+  while (client.connected() || client.available()) {
+    if (client.available()) client.readStringUntil('\n');
+    if (millis() - timeout > 4000) break;
+  }
+  client.stop();
+  Serial.println("Startup alert dispatched to Telegram.");
+  return true;
+}
+
 bool sendTelegramPhoto(camera_fb_t* fb) {
   if (WiFi.status() != WL_CONNECTED || !fb) return false;
 
@@ -235,10 +275,8 @@ bool sendTelegramPhoto(camera_fb_t* fb) {
   client.println("Connection: close");
   client.println();
 
-  // Send multipart head
   client.print(head);
 
-  // Stream raw JPEG bytes in 1024-byte chunks
   uint8_t *buf = fb->buf;
   size_t len = fb->len;
   size_t chunkSize = 1024;
@@ -250,10 +288,8 @@ bool sendTelegramPhoto(camera_fb_t* fb) {
     }
   }
 
-  // Send multipart tail
   client.print(tail);
 
-  // Await Telegram response
   unsigned long timeout = millis();
   bool success = false;
   while (client.connected() || client.available()) {
@@ -280,24 +316,19 @@ void setup() {
   delay(1000);
   Serial.println("\n=== Smart Porch Security Hub: Fast Edge Vision Node ===");
 
-  // Verify PSRAM state
   if (psramFound()) {
     Serial.printf("PSRAM Enabled! Total Free: %d bytes\n", ESP.getFreePsram());
   } else {
     Serial.println("Warning: PSRAM flag is not active! Enable in Tools menu.");
   }
 
-  // Configure clean DC Flash pin
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW);
 
-  // Initialize Camera Hardware
   initCamera();
-
-  // Connect to Wi-Fi
   connectWiFi();
 
-  // Sensor warm-up: discard initial startup frames
+  // Stabilize sensor registers
   Serial.println("Stabilizing sensor registers...");
   for (int i = 0; i < 4; i++) {
     camera_fb_t * dummy = esp_camera_fb_get();
@@ -308,57 +339,80 @@ void setup() {
   }
   Serial.println("Sensor ready!");
 
-  // Hardware interrupt trigger from PCF8574 P3
+  // Hardware interrupt trigger from PCF8574 P3 (External pull-up to 3.3V recommended)
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
+
+  // Visual confirmation: Double flash strobe
+  Serial.println("Flashing startup strobe (2x)...");
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    delay(80);
+    digitalWrite(FLASH_LED_PIN, LOW);
+    delay(100);
+  }
+
+  // Telegram boot ping
+  sendTelegramBootAlert("System Armed! Backdoor Hub online & ready.");
 
   Serial.println("System Armed! Waiting for Doorbell trigger on GPIO 13...\n");
 }
 
 void loop() {
   if (captureTriggered) {
+    // 1. Hardware Glitch / EMI Filter
+    // The Master holds P3 LOW for 50ms. If it's already HIGH after 10ms, it was an EMI spike.
+    delay(10);
+    if (digitalRead(TRIGGER_PIN) == HIGH) {
+      captureTriggered = false; // Discard noise spike
+      return;
+    }
+
+    // 2. Cooldown Lockout Check
+    if (millis() - lastCaptureTimestamp < CAM_COOLDOWN_MS) {
+      captureTriggered = false; // Discard extra click
+      return;
+    }
+
     captureTriggered = false;
-    Serial.println("\nINSTANT DOORBELL TRIGGER DETECTED!");
+    lastCaptureTimestamp = millis();
+    Serial.println("\n VALID DOORBELL TRIGGER DETECTED!");
 
     // ==========================================================
     // PHASE 1: IMMEDIATE OPTICAL CAPTURE (~150ms total)
     // ==========================================================
     digitalWrite(FLASH_LED_PIN, HIGH);
-    delay(60); // Exposure lock settling time
+    delay(60); // Settle exposure
 
-    // Flush stale unlit frame
+    // Flush stale frame
     camera_fb_t * stale = esp_camera_fb_get();
     if (stale) {
       esp_camera_fb_return(stale);
     }
 
-    // Capture the illuminated visitor
+    // Grab illuminated frame
     camera_fb_t * fb = esp_camera_fb_get();
-
-    // Turn flash OFF immediately
     digitalWrite(FLASH_LED_PIN, LOW);
 
     // ==========================================================
     // PHASE 2: SECURE CLOUD DISPATCH
     // ==========================================================
     if (fb) {
-      Serial.printf("Frame secured: %u bytes (%dx%d). Uploading with caption...\n", 
+      Serial.printf(" Frame secured: %u bytes (%dx%d). Uploading with caption...\n", 
                     fb->len, fb->width, fb->height);
 
-      // Verify network link
       if (WiFi.status() != WL_CONNECTED) {
         connectWiFi();
       }
 
-      // Upload image + caption directly
       sendTelegramPhoto(fb);
-
-      // Free buffer back to PSRAM pool
       esp_camera_fb_return(fb);
     } else {
       Serial.println("Camera capture failed!");
     }
 
+    // Flush any interrupt flag latched during the upload
+    captureTriggered = false;
     Serial.println("Complete. Re-armed and standing by.\n");
   }
 }
