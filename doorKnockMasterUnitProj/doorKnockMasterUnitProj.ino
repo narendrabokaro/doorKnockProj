@@ -35,6 +35,14 @@
  * ============================================================================
  */
 
+/**
+ * ============================================================================
+ * Project: Smart Porch Security Hub - Master Controller
+ * Target Board: LOLIN(WEMOS) D1 R2 & mini (ESP8266)
+ * File: Master_Porch_Controller.ino
+ * ============================================================================
+ */
+
 #include <Wire.h>
 #include <ESP8266WiFi.h>
 
@@ -50,9 +58,12 @@
 
 #define ONBOARD_LED     LED_BUILTIN // GPIO 2 (Active LOW on Wemos D1 Mini)
 
+// Cooldown timing
+const unsigned long COOLDOWN_INTERVAL_MS = 3000;
+unsigned long lastTriggerTime = 0;
+
 volatile bool interruptTriggered = false;
 
-// Register state tracking:
 // 1 = Quasi-bidirectional Input / Output OFF
 // 0 = Sinking Output ON
 uint8_t expanderState = 0xFF; 
@@ -61,18 +72,16 @@ IRAM_ATTR void handleInterrupt() {
   interruptTriggered = true;
 }
 
-// Writes state byte to PCF8574 over I2C
 void writePcf(uint8_t data) {
   Wire.beginTransmission(PCF_ADDRESS);
   Wire.write(data);
   Wire.endTransmission();
 }
 
-// Startup Self-Test: Blinks onboard LED and chirps I2C buzzer/LED
 void runStartupDiagnostics() {
   Serial.println("Running Startup Diagnostic Sequence...");
 
-  // 1. Onboard LED Blink
+  // Phase 1: Rapid triple blink on onboard Wemos LED
   for (int i = 0; i < 3; i++) {
     digitalWrite(ONBOARD_LED, LOW);
     delay(70);
@@ -80,60 +89,44 @@ void runStartupDiagnostics() {
     delay(70);
   }
 
-  // 2. Ping the PCF8574 address
-  Wire.beginTransmission(PCF_ADDRESS);
-  byte error = Wire.endTransmission();
-
-  if (error != 0) {
-    Serial.printf("❌ PCF8574 NOT FOUND at 0x%02X! (I2C Error code: %d)\n", PCF_ADDRESS, error);
-    Serial.println("👉 If using PCF8574A, change PCF_ADDRESS to 0x38.");
-    return;
-  }
-  Serial.printf("✅ PCF8574 acknowledged at 0x%02X!\n", PCF_ADDRESS);
-
-  // 3. Test Active-LOW (Sinking to GND)
-  Serial.println("Testing sinking output (Active-LOW: pins driven to 0)...");
+  // Phase 2: Hardware chirp via PCF8574
   expanderState &= ~(1 << LED_PIN);
   expanderState &= ~(1 << BUZZER_PIN);
   writePcf(expanderState);
-  digitalWrite(ONBOARD_LED, LOW);
-  delay(300); // 300ms so you can clearly see/hear it
 
-  // 4. Test Active-HIGH (Sourcing) in case wiring is reversed
-  Serial.println("Testing sourcing output (Active-HIGH: pins pulled to 1)...");
+  digitalWrite(ONBOARD_LED, LOW);
+  delay(120);
+
   expanderState |= (1 << LED_PIN);
   expanderState |= (1 << BUZZER_PIN);
   writePcf(expanderState);
-  digitalWrite(ONBOARD_LED, HIGH);
-  delay(300);
 
-  Serial.println("Diagnostic cycle finished.");
+  digitalWrite(ONBOARD_LED, HIGH);
+  Serial.println("Startup Self-Test Complete.");
 }
 
 void triggerAlert() {
-  Serial.println("⚡ Doorbell Activated! Triggering ESP32-CAM and sounding alert...");
+  Serial.println("Doorbell Activated! Triggering ESP32-CAM and sounding alert...");
 
-  // 1. Send immediate Active-LOW trigger pulse to ESP32-CAM (P3 = 0)
+  // 1. Send Active-LOW pulse to ESP32-CAM (P3 = 0)
   expanderState &= ~(1 << CAM_TRIGGER_PIN);
   writePcf(expanderState);
   
-  delay(50); // Pulse duration
+  delay(50); // 50ms verified pulse width
 
-  // Release camera trigger line back to HIGH (P3 = 1)
+  // Release camera trigger line back HIGH (P3 = 1)
   expanderState |= (1 << CAM_TRIGGER_PIN);
   writePcf(expanderState);
 
-  // 2. Synchronous 3x Chime & Strobe alert sequence
+  // 2. 3x Chime & Strobe alert sequence (~900ms total)
   for (int i = 0; i < 3; i++) {
-    // Outputs ON (Sink to GND)
     expanderState &= ~(1 << LED_PIN);
     expanderState &= ~(1 << BUZZER_PIN);
     writePcf(expanderState);
-    digitalWrite(ONBOARD_LED, LOW); // Mirror on Wemos LED
+    digitalWrite(ONBOARD_LED, LOW);
     
     delay(150);
     
-    // Outputs OFF
     expanderState |= (1 << LED_PIN);
     expanderState |= (1 << BUZZER_PIN);
     writePcf(expanderState);
@@ -148,39 +141,31 @@ void setup() {
   delay(500);
   Serial.println("\n=== Smart Porch Security Hub: Master Controller ===");
 
-  // 1. Completely power down Wi-Fi to eliminate current spikes and RF noise
+  // Power down Wi-Fi radio completely
   WiFi.mode(WIFI_OFF);
   WiFi.forceSleepBegin();
   delay(1);
 
-  // 2. Setup onboard LED
   pinMode(ONBOARD_LED, OUTPUT);
-  digitalWrite(ONBOARD_LED, HIGH); // Off by default
+  digitalWrite(ONBOARD_LED, HIGH);
 
-  // 3. Initialize I2C Bus & Interrupt
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000); // 100 kHz standard I2C speed
+  Wire.setClock(100000);
 
   pinMode(INT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(INT_PIN), handleInterrupt, FALLING);
 
-  // Write default state to PCF8574 (all pins HIGH / idle)
   writePcf(expanderState);
-
-  // 4. Run hardware chirp/flash boot diagnostic
   runStartupDiagnostics();
 
-  // 5. Dummy read to clear any startup interrupt latches on PCF8574
+  // Clear any startup interrupt states
   Wire.requestFrom(PCF_ADDRESS, 1);
-  if (Wire.available()) {
-    Wire.read();
-  }
+  if (Wire.available()) Wire.read();
 
   Serial.println("System Armed & Ready. Listening on PCF8574 P0...\n");
 }
 
 void loop() {
-  // Watchdog backup check in case falling edge was missed during bus idle
   if (digitalRead(INT_PIN) == LOW && !interruptTriggered) {
     interruptTriggered = true; 
   }
@@ -191,16 +176,22 @@ void loop() {
     Wire.requestFrom(PCF_ADDRESS, 1);
     if (Wire.available()) {
       uint8_t portState = Wire.read();
-      
-      // P0 is active-LOW when pressed
       bool isPressed = !(portState & (1 << BUTTON_PIN));
 
       if (isPressed) {
-        triggerAlert();
+        // Enforce 3-second lockout window
+        if (millis() - lastTriggerTime >= COOLDOWN_INTERVAL_MS) {
+          lastTriggerTime = millis();
+          triggerAlert();
+        } else {
+          Serial.println("Doorbell press ignored (Cooldown window active).");
+        }
       }
     }
     
-    // Clear interrupt flag
+    // Clear flag and flush any latched interrupts that arrived during the chime
     interruptTriggered = false;
+    Wire.requestFrom(PCF_ADDRESS, 1);
+    if (Wire.available()) Wire.read();
   }
 }
